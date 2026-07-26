@@ -1,14 +1,35 @@
 # ComfyUI-LoraTriggerTap
 
-Companion node for rgthree-style "Power LoRA Loader" nodes (built and tested against
-[Maxed-Out-99/ComfyUI-MaxedOut](https://github.com/Maxed-Out-99/ComfyUI-MaxedOut)'s
-`Lora Loader MXD`). Wire it right after your loader and it taps the trigger words for
-whichever LoRAs are currently enabled onto a `triggers` STRING output, so they follow
-each LoRA's own on/off state instead of being copy-pasted by hand.
+Trigger-word companion for ComfyUI LoRA loaders. `Lora Loader MXD` from
+[Maxed-Out-99/ComfyUI-MaxedOut](https://github.com/Maxed-Out-99/ComfyUI-MaxedOut)
+is a first-class integration and remains the primary supported loader. A universal
+compatibility layer also supports ComfyUI's built-in Load LoRA, chained loaders,
+rgthree-style power loaders, stack/list loaders, and loaders that expose common
+numbered LoRA fields.
 
 ```
 Lora Loader MXD -> LoRA Trigger Tap -> your CLIPTextEncode / prompt node
 ```
+
+You can also connect the tap after one or more built-in or third-party loaders.
+It follows upstream MODEL and CLIP links, including through pass-through nodes.
+
+## ComfyUI Desktop
+
+The node runs in ComfyUI Desktop's bundled Python server, not only in the client
+interface. Trigger extraction, MODEL/CLIP pass-through, local metadata lookup, and
+`lora_info` generation all work at backend execution time and do not require the
+JavaScript panel to be present. The interface uses ComfyUI's own API client so its
+local routes work through Desktop's embedded server.
+
+Install the complete folder in the user-selected `custom_nodes` directory shown by
+ComfyUI Desktop; do not place it in Desktop's managed `resource/ComfyUI` directory,
+which is replaced during application updates. Restart ComfyUI after installation.
+
+The rich per-LoRA controls support both classic LiteGraph rendering and the
+Vue-based Nodes 2.0 `WidgetLegacy` host. They isolate Vue-owned widget sizing,
+request redraws through Nodes 2.0's widget hook, and retain the classic canvas
+redraw path. Notifications use Desktop's native ComfyUI toast API when available.
 
 - Inputs: `model`, `clip` (from the loader). Outputs: `model`, `clip` (unchanged
   pass-through), `triggers` (STRING), `lora_info` (STRING, JSON array of
@@ -22,10 +43,10 @@ Lora Loader MXD -> LoRA Trigger Tap -> your CLIPTextEncode / prompt node
   node's widgets directly from the graph (same decoupled, no-import pattern
   this node uses to read the LoRA loader), so detection works whether or not
   `lora_info`/`triggers` are wired anywhere.
-- **Requires a "Lora Loader MXD"-compatible node to also be installed** - this node
-  only reads that node's live enabled/disabled state; it doesn't load LoRAs itself.
-  If none is found upstream, it logs a warning and outputs an empty string rather
-  than failing.
+- This node doesn't load LoRAs itself. MXD uses its own registered enabled-LoRA
+  extractor as the source of truth. Other loaders are read through a dependency-free
+  adapter for standard `lora_name` inputs, dynamic LoRA records, stack/list records,
+  and common numbered fields. Unknown loaders fail safely with an empty trigger list.
 - Trigger words are resolved locally (no network) from, in order: a `.cm-info.json`
   sidecar next to the `.safetensors`, then `modelspec.trigger_phrase`, then
   `caption_prefix` in the file's own safetensors header. A per-LoRA "Fetch" button

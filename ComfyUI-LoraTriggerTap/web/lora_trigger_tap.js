@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 // Self-contained on purpose: no imports from any other custom-node plugin's web/
 // folder, so this file has zero cross-plugin dependencies (relative imports across
@@ -7,7 +8,7 @@ import { app } from "../../scripts/app.js";
 const NODE_TYPE = "LoRA Trigger Tap";
 const MXD_LORA_LOADER_TYPE = "Lora Loader MXD";
 const ROW_HEIGHT = LiteGraph.NODE_WIDGET_HEIGHT || 20;
-const API_BASE = "./loratriggertap/api";
+const API_BASE = "/loratriggertap/api";
 
 // Per-LoRA category, click-to-cycle on the badge next to each LoRA's name.
 // Consumed by downstream nodes (e.g. Prompt Forge) that route a LoRA's trigger
@@ -95,14 +96,16 @@ function drawTogglePart(ctx, { posX, posY, height, value }) {
 }
 
 async function apiResolve(files) {
-  const r = await fetch(`${API_BASE}/resolve?files=${encodeURIComponent(files.join(","))}`, {
+  const params = new URLSearchParams();
+  for (const file of files) params.append("file", file);
+  const r = await api.fetchApi(`${API_BASE}/resolve?${params.toString()}`, {
     cache: "no-store",
   });
   return r.json();
 }
 
 async function apiFetchCivitai(file) {
-  const r = await fetch(`${API_BASE}/fetch_civitai?file=${encodeURIComponent(file)}`, {
+  const r = await api.fetchApi(`${API_BASE}/fetch_civitai?file=${encodeURIComponent(file)}`, {
     cache: "no-store",
   });
   return r.json();
@@ -110,6 +113,18 @@ async function apiFetchCivitai(file) {
 
 function showMessage(message) {
   console.error(`[LoRA Trigger Tap] ${message}`);
+  const toast = app.extensionManager?.toast;
+  if (toast?.add) {
+    toast.add({
+      severity: "error",
+      summary: "LoRA Trigger Tap",
+      detail: message.replace(/^LoRA Trigger Tap:\s*/, ""),
+      life: 4000,
+    });
+    return;
+  }
+
+  // Compatibility fallback for older ComfyUI frontends without the toast API.
   let container = document.querySelector(".loratriggertap-messages");
   if (!container) {
     container = document.createElement("div");
@@ -127,6 +142,110 @@ function showMessage(message) {
 }
 
 // ---------------------------------------------------------------------------
+// Loader compatibility. MXD is intentionally the first adapter; generic loaders
+// are normalized from their widgets without importing any other extension.
+// ---------------------------------------------------------------------------
+
+function cleanLoraName(value) {
+  if (typeof value !== "string") return null;
+  const name = value.trim();
+  return name && !["none", "null", "undefined"].includes(name.toLowerCase()) ? name : null;
+}
+
+function strengthFromObject(value) {
+  for (const key of ["strength", "strength_model", "strength_clip", "model_strength", "clip_strength", "weight"]) {
+    if (typeof value?.[key] === "number") return value[key];
+  }
+  return undefined;
+}
+
+function normalizeObjectEntry(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const name = ["lora", "lora_name", "filename", "file", "name"]
+    .map((key) => cleanLoraName(value[key]))
+    .find(Boolean);
+  if (!name) return null;
+  const strength = strengthFromObject(value);
+  const enabled =
+    !["on", "enabled", "active"].some((key) => key in value && !value[key]) &&
+    value.bypass !== true &&
+    value.muted !== true &&
+    strength !== 0;
+  return { name, strength, enabled };
+}
+
+function normalizeArrayEntry(value) {
+  if (!Array.isArray(value) || !value.length) return null;
+  const name = cleanLoraName(value[0]);
+  if (!name) return null;
+  const strengths = value.slice(1, 3).filter((item) => typeof item === "number");
+  const enabled = !strengths.length || strengths.some((item) => item !== 0);
+  return { name, strength: strengths[0], enabled };
+}
+
+function isLoaderPathInput(name) {
+  const normalized = String(name || "").toLowerCase();
+  return ["model", "clip", "lora"].some((token) => normalized.includes(token));
+}
+
+function mxdEntries(node) {
+  if (node?.type !== MXD_LORA_LOADER_TYPE) return null;
+  return (node.widgets || [])
+    .filter((widget) => widget.name?.startsWith("lora_"))
+    .map((widget) => normalizeObjectEntry(widget.value))
+    .filter(Boolean);
+}
+
+function genericEntries(node) {
+  const widgets = node?.widgets || [];
+  const entries = [];
+  const singleNameWidget = widgets.find((widget) => widget.name === "lora_name");
+  const singleName = cleanLoraName(singleNameWidget?.value);
+  if (singleName) {
+    const modelStrength = widgets.find((widget) => widget.name === "strength_model")?.value;
+    const clipStrength = widgets.find((widget) => widget.name === "strength_clip")?.value;
+    if (modelStrength !== 0 || clipStrength !== 0) {
+      entries.push({ name: singleName, strength: modelStrength ?? clipStrength, enabled: true });
+    } else {
+      entries.push({ name: singleName, strength: 0, enabled: false });
+    }
+  }
+
+  for (const widget of widgets) {
+    const key = String(widget.name || "").toLowerCase();
+    if (widget === singleNameWidget) continue;
+    const objectEntry = normalizeObjectEntry(widget.value);
+    if (objectEntry && (key.includes("lora") || "lora" in widget.value || "lora_name" in widget.value)) {
+      entries.push(objectEntry);
+      continue;
+    }
+    if (typeof widget.value === "string" && key.includes("lora") &&
+        (key.includes("name") || key.includes("file") || key.startsWith("lora_"))) {
+      const name = cleanLoraName(widget.value);
+      if (name) entries.push({ name, enabled: true });
+    }
+    if (Array.isArray(widget.value) && key.includes("lora")) {
+      const directTuple = normalizeArrayEntry(widget.value);
+      if (directTuple) {
+        entries.push(directTuple);
+      } else {
+        for (const item of widget.value) {
+          const entry = normalizeObjectEntry(item) || normalizeArrayEntry(item);
+          if (entry) entries.push(entry);
+        }
+      }
+    }
+  }
+  return [...new Map(entries.map((entry) => [entry.name, entry])).values()];
+}
+
+function loaderEntries(node) {
+  // First-class MXD adapter always gets first refusal.
+  const primary = mxdEntries(node);
+  return primary !== null ? primary : genericEntries(node);
+}
+
+// ---------------------------------------------------------------------------
 // A minimal "custom" LiteGraph widget base: rebuilds a list of clickable regions
 // every draw() call and dispatches pointerdown hits to them. Simpler than a full
 // hitAreas system (no drag tracking) - all this node needs is click-to-toggle.
@@ -137,6 +256,16 @@ class ClickRegionWidget {
     this.name = name;
     this.type = "custom";
     this._clickRegions = [];
+
+    // Nodes 2.0 renders legacy custom widgets inside a Vue WidgetLegacy host.
+    // That host owns its canvas width and may write it back onto the shared widget,
+    // which breaks LiteGraph hit-testing. These widgets always draw at the width
+    // passed to draw(), so external width writes are intentionally ignored.
+    Object.defineProperty(this, "width", {
+      configurable: true,
+      get: () => undefined,
+      set: () => {},
+    });
   }
 
   addClickRegion(x, y, w, h, onClick) {
@@ -144,7 +273,7 @@ class ClickRegionWidget {
   }
 
   mouse(event, pos, node) {
-    if (event.type !== "pointerdown") return false;
+    if (!["pointerdown", "mousedown"].includes(event.type)) return false;
     for (const region of this._clickRegions) {
       if (
         pos[0] >= region.x &&
@@ -153,10 +282,19 @@ class ClickRegionWidget {
         pos[1] <= region.y + region.h
       ) {
         region.onClick(event, pos, node);
+        this.triggerRedraw(node);
         return true;
       }
     }
     return false;
+  }
+
+  triggerRedraw(node) {
+    // WidgetLegacy attaches triggerDraw in Nodes 2.0. The other calls retain
+    // compatibility with the classic LiteGraph renderer and older frontends.
+    this.triggerDraw?.();
+    node?.setDirtyCanvas?.(true, false);
+    app.canvas?.setDirty?.(true, false);
   }
 }
 
@@ -215,11 +353,8 @@ class TriggerLoraGroupWidget extends ClickRegionWidget {
   }
 
   getStrength(node) {
-    const loaderNode = node.findConnectedLoaderNode?.();
-    const loraWidget = loaderNode?.widgets?.find(
-      (w) => w.name?.startsWith("lora_") && w.value?.lora === this.value.lora,
-    );
-    return loraWidget?.value?.strength;
+    const entry = node.getConnectedLoraEntries?.().find((item) => item.name === this.value.lora);
+    return entry?.strength;
   }
 
   draw(ctx, node, width, posY, height) {
@@ -349,6 +484,12 @@ function getTriggerWidgets(node) {
   return node.widgets.filter((w) => w.name?.startsWith("trigger_"));
 }
 
+function redrawCustomWidgets(node) {
+  for (const widget of node.widgets || []) {
+    widget.triggerRedraw?.(node);
+  }
+}
+
 app.registerExtension({
   name: "loratriggertap.LoraTriggerTap",
   async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -361,6 +502,7 @@ app.registerExtension({
         addNonTriggerWidgets(this);
       }
       recomputeSize(this);
+      redrawCustomWidgets(this);
       this.setDirtyCanvas(true, true);
     };
 
@@ -392,34 +534,49 @@ app.registerExtension({
       }
 
       recomputeSize(this);
+      redrawCustomWidgets(this);
       this.setDirtyCanvas(true, true);
     };
 
+    nodeType.prototype.findConnectedLoaderNodes = function () {
+      const found = [];
+      const visited = new Set();
+      const visit = (upstreamNode) => {
+        if (!upstreamNode || visited.has(upstreamNode.id)) return;
+        visited.add(upstreamNode.id);
+        for (const input of upstreamNode.inputs || []) {
+          if (!isLoaderPathInput(input.name) || input.link == null) continue;
+          const linkInfo = upstreamNode.graph?.links?.[input.link];
+          visit(linkInfo ? upstreamNode.graph.getNodeById(linkInfo.origin_id) : null);
+        }
+        if (loaderEntries(upstreamNode).length) found.push(upstreamNode);
+      };
+      for (const input of this.inputs || []) {
+        if (!isLoaderPathInput(input.name) || input.link == null) continue;
+        const linkInfo = this.graph?.links?.[input.link];
+        visit(linkInfo ? this.graph.getNodeById(linkInfo.origin_id) : null);
+      }
+      return found;
+    };
+
     nodeType.prototype.findConnectedLoaderNode = function () {
-      const modelSlot = this.inputs?.findIndex((i) => i.name === "model");
-      if (modelSlot == null || modelSlot < 0) return null;
-      const link = this.inputs[modelSlot]?.link;
-      if (link == null) return null;
-      const linkInfo = this.graph?.links?.[link];
-      if (!linkInfo) return null;
-      const upstreamNode = this.graph.getNodeById(linkInfo.origin_id);
-      // `.type` (not `.constructor`) is the universal LiteGraph/ComfyUI instance
-      // property set to the registered node id, regardless of whether the other
-      // plugin uses a custom JS class or ComfyUI's own default node construction.
-      return upstreamNode?.type === MXD_LORA_LOADER_TYPE ? upstreamNode : null;
+      const loaders = this.findConnectedLoaderNodes();
+      return loaders.find((node) => node.type === MXD_LORA_LOADER_TYPE) || loaders.at(-1) || null;
+    };
+
+    nodeType.prototype.getConnectedLoraEntries = function () {
+      const entries = this.findConnectedLoaderNodes().flatMap((node) => loaderEntries(node));
+      return [...new Map(entries.map((entry) => [entry.name, entry])).values()];
     };
 
     nodeType.prototype.doRefresh = async function () {
-      const loaderNode = this.findConnectedLoaderNode();
-      if (!loaderNode) {
-        showMessage("LoRA Trigger Tap: connect `model` from a Lora Loader MXD node first.");
+      const loraEntries = this.getConnectedLoraEntries();
+      if (!loraEntries.length) {
+        showMessage("LoRA Trigger Tap: connect MODEL or CLIP from a compatible LoRA loader.");
         return;
       }
 
-      const loraWidgets = (loaderNode.widgets || []).filter(
-        (w) => w.name?.startsWith("lora_") && w.value?.lora && w.value.lora !== "None",
-      );
-      const activeLoraFiles = loraWidgets.map((w) => w.value.lora);
+      const activeLoraFiles = loraEntries.map((entry) => entry.name);
 
       const existingByLora = new Map();
       for (const w of getTriggerWidgets(this)) {
@@ -432,8 +589,17 @@ app.registerExtension({
       const filesNeedingResolve = activeLoraFiles.filter((f) => !existingByLora.has(f));
       let resolved = {};
       if (filesNeedingResolve.length) {
-        const res = await apiResolve(filesNeedingResolve);
-        resolved = res?.data || {};
+        try {
+          const res = await apiResolve(filesNeedingResolve);
+          if (res?.status !== 200) {
+            showMessage(`LoRA Trigger Tap: ${res?.error || "local trigger refresh failed"}.`);
+            return;
+          }
+          resolved = res.data || {};
+        } catch (error) {
+          showMessage(`LoRA Trigger Tap: local trigger refresh failed (${error?.message || error}).`);
+          return;
+        }
       }
 
       // Drop trigger widgets for LoRAs the loader no longer lists at all (removed via
@@ -445,8 +611,8 @@ app.registerExtension({
         }
       }
 
-      for (const loraWidget of loraWidgets) {
-        const loraFile = loraWidget.value.lora;
+      for (const loraEntry of loraEntries) {
+        const loraFile = loraEntry.name;
         if (!existingByLora.has(loraFile)) {
           const info = resolved[loraFile];
           const words = (info?.words || []).map((word, i) => ({ word, checked: i === 0 }));
@@ -460,12 +626,14 @@ app.registerExtension({
       }
 
       recomputeSize(this);
+      redrawCustomWidgets(this);
       this.setDirtyCanvas(true, true);
     };
 
     nodeType.prototype.fetchTriggerWordsFor = async function (triggerWidget) {
       if (triggerWidget.fetching) return;
       triggerWidget.fetching = true;
+      triggerWidget.triggerRedraw(this);
       this.setDirtyCanvas(true, true);
       try {
         const res = await apiFetchCivitai(triggerWidget.value.lora);
@@ -480,9 +648,12 @@ app.registerExtension({
         }
         const words = res.data?.words || [];
         triggerWidget.value.words = words.map((word, i) => ({ word, checked: i === 0 }));
+      } catch (error) {
+        showMessage(`LoRA Trigger Tap: CivitAI fetch failed (${error?.message || error}).`);
       } finally {
         triggerWidget.fetching = false;
         recomputeSize(this);
+        triggerWidget.triggerRedraw(this);
         this.setDirtyCanvas(true, true);
       }
     };

@@ -1,5 +1,7 @@
-"""LoRA Trigger Tap - a companion node for rgthree-style "Power LoRA Loader" nodes
-(tested against Maxed-Out-99/ComfyUI-MaxedOut's "Lora Loader MXD").
+"""LoRA Trigger Tap - trigger-word companion for ComfyUI LoRA loaders.
+
+Maxed-Out-99/ComfyUI-MaxedOut's "Lora Loader MXD" is the primary integration,
+with a loader-agnostic fallback for built-in, stacked, and other power loaders.
 
 Passes `model`/`clip` straight through and adds a `triggers` STRING output: the
 trigger words for whichever LoRAs are currently enabled upstream, resolved from
@@ -38,6 +40,13 @@ from server import PromptServer
 
 MXD_LORA_LOADER_CLASS_TYPE = "Lora Loader MXD"
 NODE_NAME = "LoRA Trigger Tap"
+MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
+_LORA_NAME_KEYS = ("lora", "lora_name", "filename", "file", "name")
+_ENABLED_KEYS = ("on", "enabled", "active")
+_STRENGTH_KEYS = (
+  "strength", "strength_model", "strength_clip", "model_strength", "clip_strength",
+  "weight",
+)
 
 
 class _AnyType(str):
@@ -120,13 +129,22 @@ def read_cm_info_sidecar(file_path):
   if not data:
     return None
   raw_words = data.get("TrainedWords") or data.get("trainedWords") or []
+  return _normalize_trigger_words(raw_words) or None
+
+
+def _normalize_trigger_words(raw_words):
+  """Normalizes string/list metadata without splitting one string into characters."""
+  if isinstance(raw_words, str):
+    raw_words = [raw_words]
+  if not isinstance(raw_words, (list, tuple)):
+    return []
   words = []
   for entry in raw_words:
     if isinstance(entry, str) and entry.strip():
       words.append(entry.strip())
     elif isinstance(entry, dict) and entry.get("word"):
       words.append(str(entry["word"]).strip())
-  return words or None
+  return words
 
 
 def read_safetensors_header_metadata(file_path):
@@ -136,7 +154,7 @@ def read_safetensors_header_metadata(file_path):
   try:
     with open(file_path, "rb") as file:
       header_size = int.from_bytes(file.read(8), "little", signed=False)
-      if header_size <= 0:
+      if header_size <= 0 or header_size > MAX_SAFETENSORS_HEADER_BYTES:
         return {}
       header_json = json.loads(file.read(header_size))
   except (OSError, ValueError, json.JSONDecodeError):
@@ -212,31 +230,155 @@ def resolve_local_trigger_words(lora_filename, max_words=1):
 
 
 # ---------------------------------------------------------------------------
-# Reading the connected LoRA loader's live enabled/disabled state.
+# Reading connected LoRA loaders' live enabled/disabled state.
 #
-# We don't import the loader's class - we look it up through ComfyUI's own shared
-# node registry, then call its own `get_enabled_loras_from_prompt_node` classmethod
-# if it has one (true reuse of its logic). If some other/older loader is connected
-# without that classmethod, we fall back to reading its `lora_*` inputs ourselves,
-# using the same field names ("on"/"lora") that convention uses.
+# MXD is deliberately first: we call its registered class's own extractor. Other
+# loaders are normalized from common prompt formats without importing their plugin.
 # ---------------------------------------------------------------------------
 
-def _get_enabled_loras_fallback(prompt_node):
+def _clean_lora_name(value):
+  if not isinstance(value, str):
+    return None
+  value = value.strip()
+  if not value or value.lower() in {"none", "null", "undefined"}:
+    return None
+  return value
+
+
+def _entry_is_enabled(entry):
+  for key in _ENABLED_KEYS:
+    if key in entry and not bool(entry[key]):
+      return False
+  if entry.get("bypass") is True or entry.get("muted") is True:
+    return False
+  strengths = [entry[key] for key in _STRENGTH_KEYS if key in entry]
+  numeric = [value for value in strengths if isinstance(value, (int, float))]
+  return not numeric or any(value != 0 for value in numeric)
+
+
+def _normalize_lora_entry(value):
+  """Returns a common {name, strength?} record for a loader-specific value."""
+  if isinstance(value, str):
+    name = _clean_lora_name(value)
+    return {"name": name} if name else None
+  if isinstance(value, (list, tuple)) and value:
+    # Common stack convention: [filename, model_strength, clip_strength].
+    name = _clean_lora_name(value[0])
+    if name:
+      strengths = [v for v in value[1:3] if isinstance(v, (int, float))]
+      if strengths and not any(v != 0 for v in strengths):
+        return None
+      return {"name": name, "strength": strengths[0] if strengths else None}
+    return None
+  if not isinstance(value, dict) or not _entry_is_enabled(value):
+    return None
+  name = next((_clean_lora_name(value.get(key)) for key in _LORA_NAME_KEYS
+               if _clean_lora_name(value.get(key))), None)
+  if not name:
+    return None
+  strength = next((value[key] for key in _STRENGTH_KEYS
+                   if isinstance(value.get(key), (int, float))), None)
+  result = {"name": name}
+  if strength is not None:
+    result["strength"] = strength
+  return result
+
+
+def _is_prompt_link(value, prompt=None):
+  """Distinguishes Comfy graph links from [filename, strength] stack tuples."""
+  if not (isinstance(value, list) and len(value) == 2 and isinstance(value[1], int)):
+    return False
+  upstream_id = value[0]
+  if prompt is not None and str(upstream_id) in prompt:
+    return True
+  return isinstance(upstream_id, int) or (
+    isinstance(upstream_id, str) and upstream_id.isdigit()
+  )
+
+
+def _generic_enabled_loras(prompt_node, prompt=None):
+  """Understands built-in, dynamic-widget, numbered-field, and stack formats."""
+  inputs = prompt_node.get("inputs", {})
   enabled = []
-  for name, value in prompt_node.get("inputs", {}).items():
-    if not name.startswith("lora_") or not isinstance(value, dict):
+
+  # Built-in Load LoRA and compatible single-loader nodes.
+  direct_name = _clean_lora_name(inputs.get("lora_name"))
+  if direct_name:
+    direct = {
+      "lora_name": direct_name,
+      "strength_model": inputs.get("strength_model"),
+      "strength_clip": inputs.get("strength_clip"),
+    }
+    normalized = _normalize_lora_entry(direct)
+    if normalized:
+      enabled.append(normalized)
+
+  for input_name, value in inputs.items():
+    key = input_name.lower()
+    if input_name == "lora_name":
       continue
-    if value.get("on") and value.get("lora"):
-      enabled.append({"name": value["lora"]})
-  return enabled
+    if _is_prompt_link(value, prompt):
+      continue
+    if isinstance(value, dict):
+      normalized = _normalize_lora_entry(value)
+      if normalized and ("lora" in key or any(k in value for k in _LORA_NAME_KEYS)):
+        enabled.append(normalized)
+    elif isinstance(value, (list, tuple)) and "lora" in key:
+      # Either one tuple entry or a list of stack entries.
+      candidates = value if value and isinstance(value[0], (dict, list, tuple)) else [value]
+      for candidate in candidates:
+        normalized = _normalize_lora_entry(candidate)
+        if normalized:
+          enabled.append(normalized)
+    elif isinstance(value, str) and "lora" in key and (
+        "name" in key or "file" in key or key.startswith("lora_")):
+      normalized = _normalize_lora_entry(value)
+      if normalized:
+        # Numbered flat loaders often keep the matching strength in a sibling key.
+        suffix = "".join(ch for ch in key if ch.isdigit())
+        strength = next((
+          inputs.get(strength_key) for strength_key in (
+            f"strength_{suffix}", f"strength_model_{suffix}", f"lora_strength_{suffix}"
+          ) if isinstance(inputs.get(strength_key), (int, float))
+        ), None)
+        if strength == 0:
+          continue
+        if strength is not None:
+          normalized["strength"] = strength
+        enabled.append(normalized)
+
+  # Avoid double-counting the same field while retaining genuinely repeated LoRAs
+  # from separate loader nodes.
+  unique = []
+  seen = set()
+  for entry in enabled:
+    if entry["name"] not in seen:
+      seen.add(entry["name"])
+      unique.append(entry)
+  return unique
 
 
-def get_enabled_loras(prompt_node):
-  loader_class = nodes.NODE_CLASS_MAPPINGS.get(MXD_LORA_LOADER_CLASS_TYPE)
+def get_enabled_loras(prompt_node, prompt=None):
+  class_type = prompt_node.get("class_type")
+  loader_class = nodes.NODE_CLASS_MAPPINGS.get(class_type)
   get_enabled = getattr(loader_class, "get_enabled_loras_from_prompt_node", None)
+
+  # First-class MXD path gets first refusal; any published compatible extractor
+  # follows the same guarded path. A plugin version mismatch must not abort a graph.
   if callable(get_enabled):
-    return get_enabled(prompt_node)
-  return _get_enabled_loras_fallback(prompt_node)
+    try:
+      extracted = get_enabled(prompt_node)
+      if extracted is not None:
+        return extracted
+    except Exception as exc:  # Third-party extractors can fail in plugin-specific ways.
+      _log(f"{class_type}'s LoRA extractor failed ({exc}); using generic compatibility.")
+  return _generic_enabled_loras(prompt_node, prompt=prompt)
+
+
+def _is_loader_path_input(input_name):
+  """MODEL/CLIP chains plus separate LORA_STACK-style provider links."""
+  name = input_name.lower()
+  return any(token in name for token in ("model", "clip", "lora"))
 
 
 class MxdLoraTriggerTap:
@@ -272,12 +414,13 @@ class MxdLoraTriggerTap:
         continue
       trigger_entries[value["lora"]] = value
 
-    mxd_prompt_node = self._find_connected_loader_node(prompt, unique_id)
     enabled_loras = []
-    if mxd_prompt_node is not None:
-      enabled_loras = get_enabled_loras(mxd_prompt_node)
+    loader_nodes = self._find_connected_loader_nodes(prompt, unique_id)
+    if loader_nodes:
+      for loader_node in loader_nodes:
+        enabled_loras.extend(get_enabled_loras(loader_node, prompt=prompt))
     elif prompt is not None:
-      _log("`model` isn't wired directly from a Lora Loader MXD node; no triggers resolved.")
+      _log("No compatible LoRA loader was found upstream; no triggers resolved.")
 
     # Live-enabled state always comes from the loader's own prompt-node dict
     # (staleness-proof: a LoRA toggled on there is picked up here even if Refresh was
@@ -294,7 +437,9 @@ class MxdLoraTriggerTap:
     seen = set()
     lora_info = []
     for lora_entry in enabled_loras:
-      lora_name = lora_entry["name"]
+      lora_name = lora_entry.get("name") or lora_entry.get("lora")
+      if not lora_name:
+        continue
       stored = trigger_entries.get(lora_name)
       picked = []
       category = "none"
@@ -316,21 +461,41 @@ class MxdLoraTriggerTap:
     return (model, clip, triggers, json.dumps(lora_info))
 
   @staticmethod
-  def _find_connected_loader_node(prompt, unique_id):
-    """Follows this node's own `model` input link back to the prompt-dict entry for
-    the connected LoRA loader node, or None if not directly wired to one."""
+  def _find_connected_loader_nodes(prompt, unique_id):
+    """Finds compatible LoRA loaders upstream, including chained built-in nodes.
+
+    Traversal follows MODEL and CLIP prompt links, visits dependencies first to
+    preserve application order, and accepts pass-through nodes between loader/tap.
+    """
     if not prompt or unique_id is None:
-      return None
+      return []
     this_node = prompt.get(str(unique_id))
     if this_node is None:
-      return None
-    model_input = this_node.get("inputs", {}).get("model")
-    if not (isinstance(model_input, list) and len(model_input) == 2):
-      return None
-    upstream_node = prompt.get(str(model_input[0]))
-    if upstream_node is None or upstream_node.get("class_type") != MXD_LORA_LOADER_CLASS_TYPE:
-      return None
-    return upstream_node
+      return []
+
+    found = []
+    visited = set()
+
+    def visit(node_id):
+      node_id = str(node_id)
+      if node_id in visited:
+        return
+      visited.add(node_id)
+      node = prompt.get(node_id)
+      if not isinstance(node, dict):
+        return
+      for input_name, value in node.get("inputs", {}).items():
+        if not _is_loader_path_input(input_name):
+          continue
+        if isinstance(value, list) and len(value) == 2:
+          visit(value[0])
+      if get_enabled_loras(node, prompt=prompt):
+        found.append(node)
+
+    for input_name, link in this_node.get("inputs", {}).items():
+      if _is_loader_path_input(input_name) and isinstance(link, list) and len(link) == 2:
+        visit(link[0])
+    return found
 
 
 NODE_CLASS_MAPPINGS = {
@@ -361,6 +526,11 @@ def _get_param(request, param, default=None):
   return request.rel_url.query.get(param, default)
 
 
+def _get_params(request, param):
+  getall = getattr(request.rel_url.query, "getall", None)
+  return list(getall(param, [])) if callable(getall) else []
+
+
 def _sha256_of_file(file_path):
   sha256 = hashlib.sha256()
   with open(file_path, "rb") as file:
@@ -372,11 +542,14 @@ def _sha256_of_file(file_path):
 @routes.get("/loratriggertap/api/resolve")
 async def api_resolve_triggers(request):
   """Refresh: tiers 1-3 only, local reads, no network call."""
-  files_param = _get_param(request, "files")
-  files = [f for f in (files_param.split(",") if files_param else []) if f]
+  files = [f for f in _get_params(request, "file") if f]
+  if not files:
+    # Backward compatibility with clients from before repeated parameters.
+    files_param = _get_param(request, "files")
+    files = [f for f in (files_param.split(",") if files_param else []) if f]
   data = {}
   for file in files:
-    tier, words = get_trigger_word_tiers(file)
+    tier, words = await asyncio.to_thread(get_trigger_word_tiers, file)
     data[file] = {"tier": tier, "words": words}
   return web.json_response({"status": 200, "data": data})
 
@@ -395,7 +568,10 @@ async def api_fetch_civitai(request):
     return web.json_response({"status": 404, "error": f"LoRA not found: {file_param}"})
 
   async with _civitai_fetch_lock:
-    file_hash = _sha256_of_file(file_path)
+    try:
+      file_hash = await asyncio.to_thread(_sha256_of_file, file_path)
+    except OSError as exc:
+      return web.json_response({"status": 500, "error": f"Could not hash LoRA: {exc}"})
     api_url = CIVITAI_HASH_URL.format(file_hash=file_hash)
     try:
       # aiohttp's async client, not `requests` - a blocking call here would stall
@@ -414,10 +590,10 @@ async def api_fetch_civitai(request):
               "error": f"CivitAI returned HTTP {response.status}",
             })
           data = await response.json()
-    except aiohttp.ClientError as exc:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
       return web.json_response({"status": 502, "error": str(exc)})
 
-  trained_words = [w.strip() for w in (data.get("trainedWords") or []) if isinstance(w, str) and w.strip()]
+  trained_words = _normalize_trigger_words(data.get("trainedWords") or [])
 
   sidecar_path = cm_info_sidecar_path(file_path)
   cm_info = _load_json_file(sidecar_path, default={}) or {}
@@ -425,6 +601,9 @@ async def api_fetch_civitai(request):
   cm_info["civitaiModelId"] = data.get("modelId")
   cm_info["civitaiModelVersionId"] = data.get("id")
   cm_info["fetchedAt"] = time.time()
-  _save_json_file(sidecar_path, cm_info)
+  try:
+    await asyncio.to_thread(_save_json_file, sidecar_path, cm_info)
+  except OSError as exc:
+    return web.json_response({"status": 500, "error": f"Could not save trigger metadata: {exc}"})
 
   return web.json_response({"status": 200, "data": {"words": trained_words}})
